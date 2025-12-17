@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-dedupe_media.py
+dedupe_medias.py
 - Détection de doublons image/vidéo par SHA-256 (contenu seul).
 - Progression live sur 2 lignes :
     (N/Total) - % - <débit> (avg <débit>) - (Files matches : X)
@@ -10,23 +10,28 @@ dedupe_media.py
 - Spinner "..." pour les phases silencieuses (scan, regroupement).
 - Bilan avant suppression : nb de fichiers supprimables + espace récupérable.
 - Suppression interactive [Y/n/all] (par défaut = Yes) ou automatique via --assume-yes / -y.
+- Mode quarantaine optionnel pour déplacer les doublons plutôt que les supprimer.
+- Rapport CSV/JSON optionnel listant les doublons détectés.
 - --dry-run pour ne rien supprimer. Logs optionnels via --log-file.
 
 Usage :
-    python dedupe_media.py "C:\\chemin\\vers\\dossier" [--dry-run] [--log-file LOG] [-y]
+    python dedupe_medias.py "C:\\chemin\\vers\\dossier" [--dry-run] [--log-file LOG] [-y]
 """
 
 from __future__ import annotations
 import argparse
+import csv
 import hashlib
+import json
 import logging
 import os
 import sys
 import time
 import threading
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Iterable, Tuple
+from typing import Dict, List, Iterable, Tuple, Set, Optional, Callable
 from collections import deque
 
 # ---------- Support ANSI / Virtual Terminal (Windows) ----------
@@ -61,9 +66,24 @@ IMAGE_EXTS = {
 VIDEO_EXTS = {
     ".mp4", ".mov", ".mkv", ".avi", ".wmv", ".mpeg", ".mpg", ".m4v", ".3gp", ".flv", ".webm"
 }
-ALLOWED_EXTS = {e.lower() for e in (IMAGE_EXTS | VIDEO_EXTS)}
+DEFAULT_ALLOWED_EXTS = {e.lower() for e in (IMAGE_EXTS | VIDEO_EXTS)}
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
+
+
+def resolve_extensions(raw_exts: Optional[List[str]]) -> Set[str]:
+    if not raw_exts:
+        return set(DEFAULT_ALLOWED_EXTS)
+    resolved: Set[str] = set()
+    for ext in raw_exts:
+        for part in ext.split(','):
+            cleaned = part.strip().lower()
+            if not cleaned:
+                continue
+            if not cleaned.startswith('.'):
+                cleaned = '.' + cleaned
+            resolved.add(cleaned)
+    return resolved if resolved else set(DEFAULT_ALLOWED_EXTS)
 
 
 # -------------------- Utils d’affichage ------------------------
@@ -160,31 +180,35 @@ class IOStats:
         self.total_bytes = 0
         self.window = deque()  # (timestamp, bytes_incr)
         self.window_sec = window_sec
+        self._lock = threading.Lock()
 
     def add(self, n: int) -> None:
-        t = time.perf_counter()
-        self.total_bytes += n
-        self.window.append((t, n))
-        cutoff = t - self.window_sec
-        while self.window and self.window[0][0] < cutoff:
-            self.window.popleft()
+        with self._lock:
+            t = time.perf_counter()
+            self.total_bytes += n
+            self.window.append((t, n))
+            cutoff = t - self.window_sec
+            while self.window and self.window[0][0] < cutoff:
+                self.window.popleft()
 
     def avg_bps(self) -> float:
-        elapsed = max(1e-6, time.perf_counter() - self.start)
-        return self.total_bytes / elapsed
+        with self._lock:
+            elapsed = max(1e-6, time.perf_counter() - self.start)
+            return self.total_bytes / elapsed
 
     def inst_bps(self) -> float:
-        now = time.perf_counter()
-        bytes_in_window = 0
-        earliest = None
-        for (t, n) in self.window:
-            if now - t <= self.window_sec:
-                bytes_in_window += n
-                earliest = t if earliest is None else earliest
-        if not bytes_in_window:
-            return 0.0
-        elapsed = min(self.window_sec, max(1e-6, now - earliest))
-        return bytes_in_window / elapsed
+        with self._lock:
+            now = time.perf_counter()
+            bytes_in_window = 0
+            earliest = None
+            for (t, n) in self.window:
+                if now - t <= self.window_sec:
+                    bytes_in_window += n
+                    earliest = t if earliest is None else earliest
+            if not bytes_in_window:
+                return 0.0
+            elapsed = min(self.window_sec, max(1e-6, now - earliest))
+            return bytes_in_window / elapsed
 
 
 # -------------------- Tracker “files matched” -----------------
@@ -210,10 +234,30 @@ class MatchTracker:
 
 
 # ------------------------ Cœur logique ------------------------
-def iter_media_files(root: Path) -> Iterable[Path]:
+def iter_media_files(root: Path, allowed_exts: Set[str], counters: Optional[Dict[str, int]] = None) -> Iterable[Path]:
     for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in ALLOWED_EXTS:
+        try:
+            if p.is_symlink():
+                if counters is not None:
+                    counters["symlinks"] = counters.get("symlinks", 0) + 1
+                logging.debug("Lien symbolique ignoré : %s", p)
+                continue
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in allowed_exts:
+                continue
+            try:
+                p.stat()
+            except OSError as e:
+                logging.warning("Impossible d'accéder à %s : %s", p, e)
+                if counters is not None:
+                    counters["inaccessible"] = counters.get("inaccessible", 0) + 1
+                continue
             yield p
+        except OSError as e:
+            logging.warning("Erreur lors du parcours de %s : %s", p, e)
+            if counters is not None:
+                counters["inaccessible"] = counters.get("inaccessible", 0) + 1
 
 def sha256_file(path: Path, iostats: IOStats | None = None, progress_hook=None) -> str:
     """Calcule SHA-256 en lisant par chunks. Appelle progress_hook(bytes_lus) périodiquement."""
@@ -267,35 +311,67 @@ def print_progress_two_lines(current: int, total: int, path: Path, inst_bps: flo
     write_two_lines_overwrite(line1, line2)
 
 def group_by_hash(paths: Iterable[Path], iostats: IOStats, counter_offset: int,
-                  total_to_hash: int, tracker: MatchTracker) -> Dict[str, List[Path]]:
-    """Hash chaque fichier de 'paths' avec progression 2 lignes; renvoie {digest: [paths]}."""
+                  total_to_hash: int, tracker: MatchTracker, max_workers: int = 1,
+                  progress_lock: Optional[threading.Lock] = None) -> Dict[str, List[Path]]:
+    """Hash chaque fichier de 'paths' avec progression 2 lignes; renvoie {digest: [paths]}.
+
+    Si max_workers > 1, le hachage est parallélisé (ThreadPoolExecutor) en conservant
+    l'affichage de progression via un verrou partagé.
+    """
     by_hash: Dict[str, List[Path]] = {}
-    count = counter_offset
-    for p in paths:
-        count += 1
+    tracker_lock = threading.Lock()
+    progress_lock = progress_lock or threading.Lock()
 
-        def progress_hook(_bytes_read_file: int):
-            print_progress_two_lines(
-                count, total_to_hash, p,
-                iostats.inst_bps(), iostats.avg_bps(),
-                tracker.matched_files
-            )
+    def build_progress_hook(current_index: int, path: Path) -> Callable[[int], None]:
+        def _progress(_bytes_read_file: int) -> None:
+            with progress_lock:
+                print_progress_two_lines(
+                    current_index, total_to_hash, path,
+                    iostats.inst_bps(), iostats.avg_bps(),
+                    tracker.matched_files
+                )
+        return _progress
 
+    def hash_one(path: Path, current_index: int) -> Tuple[Optional[str], Path, Optional[Exception]]:
         try:
-            digest = sha256_file(p, iostats=iostats, progress_hook=progress_hook).lower()
-            tracker.add(digest)  # MAJ du compteur “Files matches”
-            by_hash.setdefault(digest, []).append(p)
+            digest = sha256_file(path, iostats=iostats,
+                                 progress_hook=build_progress_hook(current_index, path)).lower()
+            with tracker_lock:
+                tracker.add(digest)
+            return digest, path, None
         except (OSError, IOError) as e:
-            clear_two_status_lines()
-            logging.warning("Impossible de lire %s : %s", p, e)
+            with progress_lock:
+                clear_two_status_lines()
+            logging.warning("Impossible de lire %s : %s", path, e)
+            return None, path, e
+
+    if max_workers <= 1:
+        for idx, p in enumerate(paths, start=1):
+            digest, path, _err = hash_one(p, counter_offset + idx)
+            if digest:
+                by_hash.setdefault(digest, []).append(path)
+        return by_hash
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {}
+        for idx, p in enumerate(paths, start=1):
+            future = executor.submit(hash_one, p, counter_offset + idx)
+            future_to_path[future] = p
+
+        for future in as_completed(future_to_path):
+            digest, path, _err = future.result()
+            if digest:
+                by_hash.setdefault(digest, []).append(path)
+
     return by_hash
 
-def find_duplicate_groups(root: Path) -> Dict[str, List[Path]]:
+def find_duplicate_groups(root: Path, allowed_exts: Set[str], max_workers: int,
+                          counters: Dict[str, int]) -> Dict[str, List[Path]]:
     """Retourne {hash: [fichiers]} pour les doublons. Gère proprement Ctrl+C (retour partiel)."""
     logging.info("Scan du dossier : %s", root)
 
     with Spinner("Scan des fichiers médias"):
-        all_media = list(iter_media_files(root))
+        all_media = list(iter_media_files(root, allowed_exts=allowed_exts, counters=counters))
     clear_two_status_lines()
     logging.info("Fichiers candidats trouvés : %d", len(all_media))
 
@@ -320,6 +396,8 @@ def find_duplicate_groups(root: Path) -> Dict[str, List[Path]]:
     duplicates_by_hash: Dict[str, List[Path]] = {}
     processed = 0
 
+    progress_lock = threading.Lock()
+
     try:
         for size, files in by_size.items():
             if len(files) < 2:
@@ -327,7 +405,8 @@ def find_duplicate_groups(root: Path) -> Dict[str, List[Path]]:
             by_hash = group_by_hash(
                 files, iostats=iostats,
                 counter_offset=processed, total_to_hash=total_to_hash,
-                tracker=tracker
+                tracker=tracker, max_workers=max_workers,
+                progress_lock=progress_lock
             )
             processed += len(files)
             for digest, paths in by_hash.items():
@@ -340,6 +419,7 @@ def find_duplicate_groups(root: Path) -> Dict[str, List[Path]]:
         clear_two_status_lines()
         logging.info("Fichiers effectivement hashés : %d", processed)
         logging.info("Groupes de doublons trouvés : %d", len(duplicates_by_hash))
+        counters["hashed_files"] = counters.get("hashed_files", 0) + processed
 
     return duplicates_by_hash
 
@@ -360,6 +440,51 @@ def compute_stats(dupes: Dict[str, List[Path]]) -> Tuple[int, int]:
             except OSError as e:
                 logging.warning("Impossible de lire la taille de %s : %s", c, e)
     return total_files, total_bytes
+
+
+def write_reports(dupes: Dict[str, List[Path]], report_json: Optional[Path],
+                  report_csv: Optional[Path]) -> None:
+    if not report_json and not report_csv:
+        return
+
+    entries = []
+    for digest, paths in dupes.items():
+        if len(paths) <= 1:
+            continue
+        paths_sorted = sort_paths_for_original(paths)
+        keeper = paths_sorted[0]
+        duplicates = paths_sorted[1:]
+        try:
+            size_bytes = keeper.stat().st_size
+        except OSError:
+            size_bytes = None
+        entries.append({
+            "hash": digest,
+            "size_bytes": size_bytes,
+            "keeper": str(keeper),
+            "duplicates": [str(p) for p in duplicates],
+        })
+
+    if report_json:
+        report_json.parent.mkdir(parents=True, exist_ok=True)
+        with report_json.open("w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+        logging.info("Rapport JSON écrit dans %s", report_json)
+
+    if report_csv:
+        report_csv.parent.mkdir(parents=True, exist_ok=True)
+        with report_csv.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["hash", "size_bytes", "keeper", "duplicate"])
+            writer.writeheader()
+            for entry in entries:
+                for dup in entry["duplicates"]:
+                    writer.writerow({
+                        "hash": entry["hash"],
+                        "size_bytes": entry["size_bytes"],
+                        "keeper": entry["keeper"],
+                        "duplicate": dup,
+                    })
+        logging.info("Rapport CSV écrit dans %s", report_csv)
 
 
 # ------------------- Suppressions ------------------------------
@@ -391,10 +516,34 @@ def delete_file(path: Path) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Échec suppression {path} : {e}"
 
-def process_deletions(dupes: Dict[str, List[Path]], dry_run: bool, assume_yes: bool) -> None:
+
+def quarantine_file(path: Path, quarantine_dir: Path, base_folder: Path) -> Tuple[bool, str]:
+    try:
+        try:
+            rel = path.relative_to(base_folder)
+        except ValueError:
+            rel = Path(path.name)
+        target = quarantine_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        candidate = target
+        counter = 1
+        while candidate.exists():
+            candidate = candidate.with_name(f"{target.stem}_{counter}{target.suffix}")
+            counter += 1
+        shutil.move(str(path), str(candidate))
+        return True, f"Déplacé en quarantaine : {candidate}"
+    except Exception as e:
+        return False, f"Échec déplacement quarantaine {path} : {e}"
+
+def process_deletions(dupes: Dict[str, List[Path]], dry_run: bool, assume_yes: bool,
+                      quarantine_dir: Optional[Path], base_folder: Path) -> Dict[str, int]:
     groups = 0
     total_candidates = 0
     total_deleted = 0
+    total_quarantined = 0
+    total_failed = 0
+    reclaimed_bytes = 0
+    groups_with_errors = 0
     state = {"all_mode": False}
 
     if assume_yes:
@@ -406,6 +555,7 @@ def process_deletions(dupes: Dict[str, List[Path]], dry_run: bool, assume_yes: b
         original = paths_sorted[0]
         candidates = paths_sorted[1:]
         total_candidates += len(candidates)
+        group_error = False
 
         try:
             size_bytes = original.stat().st_size
@@ -432,23 +582,61 @@ def process_deletions(dupes: Dict[str, List[Path]], dry_run: bool, assume_yes: b
 
         for c in candidates:
             do_delete = True if state.get("all_mode") else prompt_delete(c, state)
-            if do_delete:
+            if not do_delete:
+                logging.info("Conservé (choix utilisateur) : %s", c)
+                continue
+
+            try:
+                size = c.stat().st_size
+            except OSError:
+                size = 0
+
+            if quarantine_dir:
+                ok, msg = quarantine_file(c, quarantine_dir=quarantine_dir, base_folder=base_folder)
+                if ok:
+                    total_quarantined += 1
+                    reclaimed_bytes += size
+                    logging.info(msg)
+                else:
+                    group_error = True
+                    total_failed += 1
+                    logging.error(msg)
+            else:
                 ok, msg = delete_file(c)
                 if ok:
                     total_deleted += 1
+                    reclaimed_bytes += size
                     logging.info(msg)
                 else:
+                    group_error = True
+                    total_failed += 1
                     logging.error(msg)
-            else:
-                logging.info("Conservé (choix utilisateur) : %s", c)
+
+        if group_error:
+            groups_with_errors += 1
 
     print("\n" + "-" * 80)
     print(f"Groupes de doublons traités : {groups}")
     print(f"Fichiers doublons proposés/susceptibles de suppression : {total_candidates}")
-    if not dry_run:
-        print(f"Fichiers effectivement supprimés : {total_deleted}")
-    else:
+    if dry_run:
         print("[DRY-RUN] Aucune suppression effectuée.")
+    elif quarantine_dir:
+        print(f"Fichiers déplacés en quarantaine : {total_quarantined}")
+    else:
+        print(f"Fichiers effectivement supprimés : {total_deleted}")
+    print(f"Espace récupéré : {human_size(reclaimed_bytes)}")
+    if groups_with_errors:
+        print(f"Groupes ayant rencontré des erreurs : {groups_with_errors}")
+
+    return {
+        "groups": groups,
+        "candidates": total_candidates,
+        "deleted": total_deleted,
+        "quarantined": total_quarantined,
+        "failed": total_failed,
+        "reclaimed_bytes": reclaimed_bytes,
+        "groups_with_errors": groups_with_errors,
+    }
 
 
 # ---------------------- Logging & main -------------------------
@@ -476,6 +664,13 @@ def main() -> None:
     parser.add_argument("--log-file", type=str, default=None, help="Chemin du fichier de logs (optionnel).")
     parser.add_argument("--assume-yes", "-y", action="store_true",
                         help="Supprime automatiquement tous les doublons sans demander (dangereux).")
+    parser.add_argument("--extensions", action="append", help="Limiter aux extensions voulues (ex: --extensions .jpg,.png)")
+    parser.add_argument("--report-json", type=Path, help="Chemin du rapport JSON des doublons détectés.")
+    parser.add_argument("--report-csv", type=Path, help="Chemin du rapport CSV des doublons détectés.")
+    parser.add_argument("--quarantine-dir", type=Path,
+                        help="Dossier de quarantaine (déplacement des doublons au lieu de les supprimer).")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Nombre de fichiers à hasher en parallèle (par défaut 1, augmenter sur SSD/NVMe).")
     args = parser.parse_args()
 
     if not args.folder.exists() or not args.folder.is_dir():
@@ -484,11 +679,16 @@ def main() -> None:
 
     configure_logging(args.log_file)
 
-    logging.info("Extensions prises en compte : %s", ", ".join(sorted(ALLOWED_EXTS)))
+    allowed_exts = resolve_extensions(args.extensions)
+    logging.info("Extensions prises en compte : %s", ", ".join(sorted(allowed_exts)))
     logging.info("Mode dry-run : %s", args.dry_run)
     logging.info("Suppression auto (--assume-yes / -y) : %s", args.assume_yes)
+    logging.info("Travailleurs parallèles (hash) : %d", args.workers)
 
-    duplicates = find_duplicate_groups(args.folder)
+    counters: Dict[str, int] = {}
+
+    duplicates = find_duplicate_groups(args.folder, allowed_exts=allowed_exts,
+                                       max_workers=max(1, args.workers), counters=counters)
 
     if not duplicates:
         print("Aucun doublon trouvé. 🎉")
@@ -508,7 +708,30 @@ def main() -> None:
         print("Des confirmations [Y/n/all] seront demandées pour chaque doublon.")
     print("#" * 80 + "\n")
 
-    process_deletions(duplicates, dry_run=args.dry_run, assume_yes=args.assume_yes)
+    if args.quarantine_dir and not args.dry_run:
+        args.quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+    report_json_path = args.report_json if args.report_json else None
+    report_csv_path = args.report_csv if args.report_csv else None
+    write_reports(duplicates, report_json=report_json_path, report_csv=report_csv_path)
+
+    summary = process_deletions(
+        duplicates, dry_run=args.dry_run, assume_yes=args.assume_yes,
+        quarantine_dir=args.quarantine_dir, base_folder=args.folder,
+    )
+
+    print("\nRÉCAPITULATIF")
+    print(f"  Groupes analysés : {summary['groups']}")
+    print(f"  Fichiers doublons candidats : {summary['candidates']}")
+    print(f"  Espace réellement récupéré : {human_size(summary['reclaimed_bytes'])}")
+    print(f"  Fichiers déplacés en quarantaine : {summary['quarantined']}")
+    print(f"  Fichiers supprimés : {summary['deleted']}")
+    if summary['groups_with_errors']:
+        print(f"  Groupes ignorés/partiels suite à erreurs : {summary['groups_with_errors']}")
+    if counters:
+        print(f"  Liens symboliques ignorés : {counters.get('symlinks', 0)}")
+        print(f"  Fichiers inaccessibles ignorés : {counters.get('inaccessible', 0)}")
+        print(f"  Fichiers hashés : {counters.get('hashed_files', 0)}")
     print("\nTerminé.")
 
 if __name__ == "__main__":
