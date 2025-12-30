@@ -4,9 +4,10 @@
 """
 dedupe_medias.py
 - Détection de doublons image/vidéo par SHA-256 (contenu seul).
-- Progression live sur 2 lignes :
+ - Progression live sur 3 lignes :
     (N/Total) - % - <débit> (avg <débit>) - (Files matches : X)
     Parsing fichier : <chemin>
+    [=====>....] % (N/Total)  # barre de progression style wget
 - Spinner "..." pour les phases silencieuses (scan, regroupement).
 - Bilan avant suppression : nb de fichiers supprimables + espace récupérable.
 - Suppression interactive [Y/n/all] (par défaut = Yes) ou automatique via --assume-yes / -y.
@@ -108,24 +109,37 @@ def write_line_overwrite(text: str) -> None:
     sys.stdout.write("\r" + text.ljust(width - 1)[:width - 1])
     sys.stdout.flush()
 
-def write_two_lines_overwrite(line1: str, line2: str) -> None:
-    """Écrit/rafraîchit 2 lignes, puis remonte le curseur de 2 lignes pour réécriture au même endroit."""
+def write_status_lines(lines: List[str]) -> None:
+    """
+    Affiche un bloc de lignes en le réécrivant au même endroit.
+    - Si les séquences ANSI sont dispo : on remonte le curseur.
+    - Sinon : fallback sur une seule ligne pour éviter le flood console.
+    """
+    if not HAS_VT and len(lines) > 1:
+        write_line_overwrite(" | ".join(lines))
+        return
+
     width = term_width()
-    out = (
-        "\r"
-        + line1.ljust(width - 1)[:width - 1]
-        + "\n"
-        + line2.ljust(width - 1)[:width - 1]
-    )
+    padded = [ln.ljust(width - 1)[:width - 1] for ln in lines]
+    out = "\r" + "\n".join(padded)
     sys.stdout.write(out)
-    # Remonte le curseur de 2 lignes (ANSI). Windows 10+ supporte l’ANSI dans le terminal moderne.
-    sys.stdout.write("\x1b[2A")
+    sys.stdout.write(f"\x1b[{len(lines)}A")
+    sys.stdout.flush()
+
+def clear_status_lines(nb_lines: int = 2) -> None:
+    if not HAS_VT:
+        # Sur les consoles sans ANSI, on efface uniquement la ligne courante.
+        write_line_overwrite("")
+        return
+    width = term_width()
+    blank = " " * (width - 1)
+    out = "\r" + "\n".join(blank for _ in range(nb_lines))
+    out += f"\x1b[{nb_lines}A"
+    sys.stdout.write(out)
     sys.stdout.flush()
 
 def clear_two_status_lines() -> None:
-    width = term_width()
-    sys.stdout.write("\r" + " " * (width - 1) + "\n" + " " * (width - 1) + "\r")
-    sys.stdout.flush()
+    clear_status_lines(2)
 
 
 # ---------------------- Spinner -------------------------------
@@ -308,7 +322,17 @@ def print_progress_two_lines(current: int, total: int, path: Path, inst_bps: flo
     max_path = max(10, width - len(prefix) - 2)
     shown = truncate_middle(str(path), max_path)
     line2 = prefix + shown
-    write_two_lines_overwrite(line1, line2)
+
+    bar_width = max(10, min(60, width - 30))
+    filled = int(bar_width * pct / 100)
+    rest = bar_width - filled
+    if rest > 0 and filled < bar_width:
+        bar_body = "=" * filled + ">" + "." * (rest - 1)
+    else:
+        bar_body = "=" * bar_width
+    bar_line = f"[{bar_body}] {pct:3d}% ({current}/{total})"
+
+    write_status_lines([line1, line2, bar_line])
 
 def group_by_hash(paths: Iterable[Path], iostats: IOStats, counter_offset: int,
                   total_to_hash: int, tracker: MatchTracker, max_workers: int = 1,
@@ -341,7 +365,7 @@ def group_by_hash(paths: Iterable[Path], iostats: IOStats, counter_offset: int,
             return digest, path, None
         except (OSError, IOError) as e:
             with progress_lock:
-                clear_two_status_lines()
+                clear_status_lines(3)
             logging.warning("Impossible de lire %s : %s", path, e)
             return None, path, e
 
@@ -413,10 +437,10 @@ def find_duplicate_groups(root: Path, allowed_exts: Set[str], max_workers: int,
                 if len(paths) > 1:
                     duplicates_by_hash.setdefault(digest, []).extend(paths)
     except KeyboardInterrupt:
-        clear_two_status_lines()
+        clear_status_lines(3)
         logging.warning("Interruption utilisateur : retour partiel des doublons trouvés jusque-là.")
     finally:
-        clear_two_status_lines()
+        clear_status_lines(3)
         logging.info("Fichiers effectivement hashés : %d", processed)
         logging.info("Groupes de doublons trouvés : %d", len(duplicates_by_hash))
         counters["hashed_files"] = counters.get("hashed_files", 0) + processed
